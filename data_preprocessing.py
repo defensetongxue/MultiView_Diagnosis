@@ -25,100 +25,103 @@ if __name__=='__main__':
     data_path= args.data_path
     
     print(f'处理数据集路径 {data_path}')
-    #  每一行都是一个数据,赋予一个image_id
-    image_name_list=sorted(os.listdir(os.path.join(data_path,'images')))
+
+    # 读取数据
+    with open(os.path.join(data_path, 'annotations.json'), 'r') as f:
+        data_dict = json.load(f)
+    with open(os.path.join(data_path, 'follow_up.json'), 'r') as f:
+        follow_up_dict = json.load(f)
+    
+    # 构建hid到image_names的映射，并生成hid_label
+    hid_images = {}
+    hid_label = {}
+    
+    for hid in follow_up_dict:
+        image_names = []
+        max_label = 0
+        for record in follow_up_dict[hid]:
+            for eye in ['OD', 'OS']:
+                if eye in record['result']:
+                    for image_name, label in record['result'][eye].items():
+                        image_names.append(image_name)
+                        max_label = max(max_label, label)
+        hid_images[hid] = image_names
+        hid_label[hid] = max_label
     
     # 初始化5个桶
-    baket_dict = {i: [] for i in range(1, 6)}
-    patient_buckets = defaultdict(list) 
-
-    # 记录所有的患者ID
-    patient_set = set() 
-
-    # 将图片根据患者ID进行分组
-    for image_id, image_name in enumerate(image_name_list):
-        data_info = unpack_name(image_name)
-        image_path = os.path.join(data_path, 'images', image_name)
-        data_dict[image_id] = {
-            **data_info,  # 解构data_info
-            'image_path': image_path,
-            'image_id': image_id,
-            'image_name': image_name
-        }
-        patient_set.add(data_info['patient_id'])    
-
-    # 将患者ID排序，并shuffle
-    patient_list = sorted(patient_set)
-    random.shuffle(patient_list)  # 在分配前shuffle，增加随机性
-    num_patients = len(patient_list)
-    split_indices = [
-        int(0.2 * num_patients),
-        int(0.4 * num_patients),
-        int(0.6 * num_patients),
-        int(0.8 * num_patients),
-        num_patients
-    ]   
-
-    # 将患者分配到相应的桶
-    for i, patient_id in enumerate(patient_list):
-        if i < split_indices[0]:
-            bucket_id = 1
-        elif i < split_indices[1]:
-            bucket_id = 2
-        elif i < split_indices[2]:
-            bucket_id = 3
-        elif i < split_indices[3]:
-            bucket_id = 4
-        else:
-            bucket_id = 5   
-
-        # 将该患者的所有图像放入对应的桶
-        for image_id, data in data_dict.items():
-            if data['patient_id'] == patient_id:
-                baket_dict[bucket_id].append(image_id)  
-
-    # 按照比例分配 train/val/test
-    for split_name in range(1, 6):
-        split_list = {'train': [], 'val': [], 'test': []}  # 都是id_list
-        for bucket_id, image_ids in baket_dict.items():
-            total_images = len(image_ids)
-            train_split = int(0.7 * total_images)
-            val_split = int(0.85 * total_images)    
-
-            # 将每个桶中的数据按比例分为train, val, test
-            split_list['train'].extend(image_ids[:train_split])
-            split_list['val'].extend(image_ids[train_split:val_split])
-            split_list['test'].extend(image_ids[val_split:])    
-
-        # 保存分割结果
-        os.makedirs(os.path.join(data_path, 'split'), exist_ok=True)
-        split_file_path = os.path.join(data_path, 'split', f'{split_name}.json')
-        json.dump(split_list, open(split_file_path, 'w'), indent=4) 
-
-        print(f'Split {split_name} saved to {split_file_path}')
+    baket_dict = {i: [] for i in range(5)}
     
-    # 生成enhanced
+    # 根据hid_label预先划分数据集，每个hid_label随机分为5个桶，如果存在某一个hid_label的数据少于5个，则报错
+    hid_label_type = set(hid_label.values())
+    for label in hid_label_type:
+        # 收集属于该label的hid
+        hids = [hid for hid in hid_label if hid_label[hid] == label]
+        # 如果某个label的hid数量少于5个，报错
+        if len(hids) < 5:
+            raise ValueError(f"Label {label} 的hid数量少于5个，无法进行5折划分")
+        # 随机打乱
+        random.shuffle(hids)
+        # 划分桶
+        for i, hid in enumerate(hids):
+            baket_dict[i % 5].append(hid)
+    
+    # 生成5折交叉验证的数据集，每个都存储在一个json，3个用来train，1个用来val，1个用来test，每一个内部是image_name
+    for fold in range(5):
+        split_dict = {'train': [], 'val': [], 'test': []}
+        test_basket = fold
+        val_basket = (fold + 1) % 5
+        train_baskets = [b for b in range(5) if b != test_basket and b != val_basket]
+    
+        # 将训练集数据放入split_dict['train']
+        for b in train_baskets:
+            for hid in baket_dict[b]:
+                split_dict['train'].extend(hid_images[hid])
+        # 将验证集数据放入split_dict['val']
+        for hid in baket_dict[val_basket]:
+            split_dict['val'].extend(hid_images[hid])
+        # 将测试集数据放入split_dict['test']
+        for hid in baket_dict[test_basket]:
+            split_dict['test'].extend(hid_images[hid])
+    
+        # 保存到对应的json文件
+        with open(f'dataset_fold_{fold}.json', 'w') as f:
+            json.dump(split_dict, f)
+    
+        # 输出结果
+        print(f"Fold {fold}:")
+        print(f"Train set size: {len(split_dict['train'])}")
+        print(f"Validation set size: {len(split_dict['val'])}")
+        print(f"Test set size: {len(split_dict['test'])}")
+        
     if GenEnhanced:
         os.makedirs(os.path.join(data_path,'enhanced'),exist_ok=True)
         enhancer=Enhancer()
-        for image_id in data_dict:
-            enhanced_path=os.path.join(data_path,'enhanced',data_dict[image_id]['image_name'])
+        for image_name in data_dict:
+            enhanced_path=os.path.join(data_path,'enhanced',data_dict[image_name]['image_name'])
+            if os.path.exists(enhanced_path):
+                if 'enhanced_path' not in data_dict[image_name]:
+                    raise ValueError(f'enhanced_path not in data_dict in {image_name}')
+                continue
             enhancer.enhanced_image(
-                image_path=data_dict[image_id]['image_path'],
+                image_path=data_dict[image_name]['image_path'],
                 save_path=enhanced_path)
-            data_dict[image_id]['enhanced_path']=enhanced_path
+            data_dict[image_name]['enhanced_path']=enhanced_path
     
         print('增强处理完成')
     
     # 生成mask 
     if GenMask:
         os.makedirs(os.path.join(data_path,'mask'),exist_ok=True)
-        for image_id in data_dict:
-            mask_path=os.path.join(data_path,'mask',data_dict[image_id]['image_name'])
+        for image_name in data_dict:
+            if os.path.exists(data_dict[image_name]['mask_path']):
+                if 'mask_path' not in data_dict[image_name]:
+                    raise ValueError(f'mask_path not in data_dict in {image_name}')
+                continue
+            mask_path=os.path.join(data_path,'mask',data_dict[image_name]['image_name'])
             generate_mask(
-                image_path=data_dict[image_id]['image_path'],
+                image_path=data_dict[image_name]['image_path'],
                 save_path=mask_path
             )
-            data_dict[image_id]['mask_path']=mask_path
+            data_dict[image_name]['mask_path']=mask_path
     
         print('掩码生成完成')
